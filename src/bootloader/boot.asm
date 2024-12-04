@@ -34,7 +34,182 @@ ebr_system_id:              db 'FAT12   '           ; 8 bytes
 ;
 
 start:
-    jmp main            ; Ensure main is start point
+    ; Setup data segments
+    mov ax, 0           ; Cannot write to ds/es directly
+    mov ds, ax
+    mov es, ax
+
+    ; Setup stack
+    mov ss, ax
+    mov sp, 0x7C00      ; Stack grows downwards, so put pointer as start of program.
+
+    push es
+    push word .after
+    retf
+
+.after:
+
+    ; Read something from floppy disk
+    mov [ebr_drive_number], dl
+
+    ; Show loading message
+    mov si, msg_loading
+    call puts
+
+    ; Read drive parameters (sectors per track and head count)
+    push es
+    mov ah, 08h
+    int 13h
+    jc floppy_error
+    pop es
+
+    and cl, 0x3F                        ; Remove top 2 bits
+    xor ch, ch
+    mov [bdb_sectors_per_track], cx     ; Sector count
+
+    inc dh
+    mov [bdb_heads], dh                 ; Head count
+
+    ; Read FAT root directory
+    mov ax, [bdb_sectors_per_fat]       ; LBA of root dir = reserved + fats * sectors per fat
+    mov bl, [bdb_fat_count]
+    xor bh, bh
+    mul bx                              ; ax = (fats * sectors_per_fat)
+    add ax, [bdb_reserved_sectors]      ; ax = LBA of root
+    push ax
+
+    ; Compute size of root directory = (32 * number_of_entries) / bytes_per_sector
+    mov ax, [bdb_dir_entries_count]
+    shl ax, 5                           ; ax *= 32
+    xor dx, dx                          ; dx = 0
+    div word [bdb_bytes_per_sector]     ; number of sectors we need to read
+
+    test dx, dx                         ; if dx != 0, add 1
+    jz .root_dir_after
+    inc ax                              ; division remainder != 0, add 1
+                                        ; this means we have a sector only partially filled with entries
+.root_dir_after:
+    
+    ; Read root directory
+    mov cl, al                          ; cl = number of sectors to read = size of root directory
+    pop ax                              ; ax = LBA of root directory
+    mov dl, [ebr_drive_number]
+    mov bx, buffer                      ; es:bx = buffer
+    call disk_read
+
+    ; Search for kernel.bin
+    xor bx, bx
+    mov di, buffer
+
+.search_kernel:
+    mov si, file_kernel_bin
+    mov cx, 11                          ; compare up to 11 characters
+    push di
+    repe cmpsb
+    pop di
+    je .found_kernel
+
+    add di, 32
+    inc bx
+    cmp bx, [bdb_dir_entries_count]
+    jl .search_kernel
+
+    ; Kernel not found
+    jmp kernel_not_found_error
+
+.found_kernel
+
+    ; di should have the address of the entry
+    mov ax, [di + 26]
+    mov [kernel_cluster], ax
+    
+    ; Load FAT from disk into memory
+    mov ax, [bdb_reserved_sectors]
+    mov bx, buffer
+    mov cl, [bdb_sectors_per_fat]
+    mov dl, [ebr_drive_number]
+    call disk_read
+
+    ; Read kernel and process FAT chain
+    mov bx, KERNEL_LOAD_SEGMENT
+    mov es, bx
+    mov bx, KERNEL_LOAD_OFFSET
+
+.load_kernel_loop:
+    
+    ; Read next cluster
+    mov ax, [kernel_cluster]
+    add ax, 31                          ; not nice hardcoded value :(
+
+    mov cl, 1
+    mov dl, [ebr_drive_number]
+    call disk_read
+
+    add bx, [bdb_bytes_per_sector]
+
+    ; Compute location of next cluster
+    mov ax, [kernel_cluster]
+    mov cx, 3
+    mul cx
+    mov cx, 2
+    div cx
+
+    mov si, buffer
+    add si, ax
+    mov ax, [ds:si]
+
+    or dx, dx
+    jz .even
+
+.odd:
+    shr ax, 4
+    jmp .next_cluster_after
+
+.even:
+    and ax, 0x0FFF
+
+.next_cluster_after:
+    cmp ax, 0x0FF8
+    jae .read_finish
+
+    mov [kernel_cluster], ax
+    jmp .load_kernel_loop
+
+.read_finish:
+    ; Jump to our kernel
+    mov dl, [ebr_drive_number]          ; boot device in dl
+
+    mov ax, KERNEL_LOAD_SEGMENT         ; set segment registers
+    mov ds, ax
+    mov es, ax
+
+    jmp KERNEL_LOAD_SEGMENT:KERNEL_LOAD_OFFSET
+
+    ; Should never happen
+    jmp wait_key_and_reboot
+
+    cli                                 ; Disable interupts
+    hlt                                 ; Halts CPU
+
+; Error Handlers
+floppy_error:
+    mov si, msg_read_failed
+    call puts
+    jmp wait_key_and_reboot
+
+kernel_not_found_error:
+    mov si, msg_kernel_not_found
+    call puts
+    jmp wait_key_and_reboot
+
+wait_key_and_reboot:
+    mov ah, 0
+    int 16h
+    jmp 0FFFFh:0
+
+.halt:
+    cli
+    hlt
 
 ; Prints a string to the screen.
 ; Params:
@@ -62,46 +237,6 @@ puts:
     pop ax
     pop si
     ret
-
-; Main entry point of program
-main:
-    ; Setup data segments
-    mov ax, 0           ; Cannot write to ds/es directly
-    mov ds, ax
-    mov es, ax
-
-    ; Setup stack
-    mov ss, ax
-    mov sp, 0x7C00      ; Stack grows downwards, so put pointer as start of program.
-
-    ; Read something from floppy disk
-    mov [ebr_drive_number], dl
-    mov ax, 1
-    mov cl, 1
-    mov bx, 0x7E00
-    call disk_read
-
-    ; Print startup message
-    mov si, msg_hello
-    call puts
-
-    cli
-    hlt                 ; Halts CPU
-
-; Error Handlers
-floppy_error:
-    mov si, msg_read_failed
-    call puts
-    jmp wait_key_and_reboot
-
-wait_key_and_reboot:
-    mov ah, 0
-    int 16h
-    jmp 0FFFFh:0
-
-.halt:
-    cli
-    hlt
 
 ; Disk routines
 
@@ -194,10 +329,16 @@ disk_reset:
     popa
     ret
 
-; Set message on startup
-msg_hello:              db 'Hello world!', ENDL, 0
+msg_loading:            db 'Loading...', ENDL, 0
 msg_read_failed:        db 'Read failed from disk!', ENDL, 0
+msg_kernel_not_found:   db 'KERNEL.BIN file not found!', ENDL, 0
+file_kernel_bin:        db 'KERNEL  BIN'
+kernel_cluster:         dw 0
 
-; BOIS expects last sector to be 0AA55h
-times 510-($-$$) db 0   ; db emits bytes, times repeats instruction, $-$$ is size of program in nasm
-dw 0AA55h               ; Put the final sector
+KERNEL_LOAD_SEGMENT     equ 0x2000
+KERNEL_LOAD_OFFSET      equ 0
+
+times 510-($-$$) db 0
+dw 0AA55h
+
+buffer:
